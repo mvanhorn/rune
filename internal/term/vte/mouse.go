@@ -37,6 +37,7 @@ type mouseDriver struct {
 	// with the content. Recording the offset lets SetSelectionEnd keep the
 	// anchor pinned to the originally pressed content cell.
 	selectionStartScrollY int
+	drag                  dragState
 	hookRawBytes          []byte
 	clipboard             clipboard.Register
 	// held is the button the program saw pressed; pressed guards it
@@ -49,10 +50,33 @@ type mouseDriver struct {
 	lastSeen bool
 }
 
+// dragState tracks a left-button gesture. For every held-button event,
+// including pointer jitter inside the pressed cell, the SDK calls
+// SetSelectionEnd and then auto-scrolls when the pointer is near the top
+// or bottom edge. A plain click (for example to focus the window) must
+// therefore neither highlight, scroll nor copy until the pointer leaves
+// the pressed cell.
+type dragState uint8
+
+const (
+	dragIdle dragState = iota
+	// dragPressed is a held left button still inside the pressed cell.
+	dragPressed
+	// dragSelecting is a held left button whose highlight follows the
+	// pointer.
+	dragSelecting
+)
+
 func (e *mouseDriver) OnAction(
 	ev term.Event, pos term.Coordinates, action mouse.Action,
 ) bool {
+	// The SDK reports held-button moves without an action, so any action
+	// ends the previous left-button gesture.
+	e.drag = dragIdle
 	switch action {
+	case mouse.LeftClick:
+		e.drag = dragPressed
+		return false
 	case mouse.MiddleClick:
 		paste, _ := e.clipboard.Paste(clipboard.DefaultRegisterID)
 		e.hookRawBytes = []byte(paste.Text)
@@ -249,11 +273,17 @@ func (e *mouseDriver) alternateScroll(ev term.Event) []byte {
 }
 
 func (e *mouseDriver) ScrollUp(n int) (ok bool) {
+	if e.drag == dragPressed {
+		return
+	}
 	e.t.ScrollUp(n)
 	return
 }
 
 func (e *mouseDriver) ScrollDown(n int) (ok bool) {
+	if e.drag == dragPressed {
+		return
+	}
 	e.t.ScrollDown(n)
 	return
 }
@@ -282,6 +312,12 @@ func (e *mouseDriver) SetSelectionEnd(pos term.Coordinates) {
 	// produce from > to, and the buffer's internal sort then drops the
 	// press cell and the drag-end cell from the selection.
 	end := pos
+	if e.drag != dragSelecting {
+		if end == start {
+			return
+		}
+		e.drag = dragSelecting
+	}
 	if end.Y < start.Y || (end.Y == start.Y && end.X < start.X) {
 		start, end = end, start
 	}

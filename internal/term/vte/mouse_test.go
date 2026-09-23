@@ -21,6 +21,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/unstablebuild/rune-go-sdk/clipboard"
+	"github.com/unstablebuild/rune-go-sdk/mouse"
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"unstable.build/rune/internal/term/vte/vteparser"
 )
@@ -216,6 +218,266 @@ func TestMouseDriverAlternateScroll(t *testing.T) {
 				d.t.parserHandler.UnsetPrivateMode(mode)
 			}
 			assert.Equal(t, tc.want, string(d.alternateScroll(tc.ev)))
+		})
+	}
+}
+
+// recordingClipboard counts Copy calls on top of an in-memory register.
+type recordingClipboard struct {
+	clipboard.Register
+	copies []string
+}
+
+func (c *recordingClipboard) Copy(registerID string, data clipboard.Data) error {
+	c.copies = append(c.copies, data.Text)
+	return c.Register.Copy(registerID, data)
+}
+
+// TestMouseDriverSelectionCopy pins when a terminal highlight replaces the
+// clipboard. A click, or pointer jitter that stays inside the pressed cell,
+// must not highlight or copy anything; a drag that reaches another cell
+// highlights and copies as before.
+func TestMouseDriverSelectionCopy(t *testing.T) {
+	t.Parallel()
+
+	const sentinel = "previously-copied"
+	press := term.Coordinates{X: 1}
+
+	cases := []struct {
+		desc string
+		drag []term.Coordinates
+		want string // expected highlight, empty for none
+	}{
+		{
+			desc: "click without movement",
+		},
+		{
+			desc: "jitter inside the pressed cell",
+			drag: []term.Coordinates{press, press, press},
+		},
+		{
+			desc: "drag right",
+			drag: []term.Coordinates{press, {X: 4}},
+			want: "ello",
+		},
+		{
+			desc: "drag left",
+			drag: []term.Coordinates{{X: 0}},
+			want: "he",
+		},
+		{
+			desc: "drag to the next row",
+			drag: []term.Coordinates{{X: 1, Y: 1}},
+			want: "ello world     \nfo",
+		},
+		{
+			desc: "drag away and back keeps the pressed cell",
+			drag: []term.Coordinates{{X: 3}, press},
+			want: "e",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+			tm := mockTabManager{}
+			comp, err := NewComponent(&testExecutor{}, &testExecutor{}, &tm, DefaultConfig())
+			require.NoError(t, err)
+			p := comp.parserHandler
+			p.sync.primBuf.SetDefaultChar(' ')
+			comp.Resize(16, 3)
+			writeToBuffer(p, "hello world\nfoo_bar")
+
+			clip := &recordingClipboard{Register: clipboard.NewInMemory()}
+			require.NoError(t, clip.Register.Copy(
+				clipboard.DefaultRegisterID, clipboard.Data{Text: sentinel}))
+			driver := &mouseDriver{t: comp, clipboard: clip}
+
+			// Mirror mouse.Mouse.handleLeftClickSelect: the press clears and
+			// anchors, then every held-button event calls SetSelectionEnd.
+			driver.ClearSelection()
+			driver.SetSelectionStart(press)
+			for _, pos := range tc.drag {
+				driver.SetSelectionEnd(pos)
+			}
+
+			got, ok := comp.Selection()
+			pasted, err := clip.Paste(clipboard.DefaultRegisterID)
+			require.NoError(t, err)
+			if tc.want == "" {
+				assert.False(t, ok, "unexpected highlight %q", got)
+				assert.Empty(t, clip.copies)
+				assert.Equal(t, sentinel, pasted.Text)
+				return
+			}
+			require.True(t, ok)
+			assert.Equal(t, tc.want, got)
+			assert.Equal(t, tc.want, pasted.Text)
+		})
+	}
+}
+
+// TestMouseDriverWordAndLineSelectionCopy pins that double- and
+// triple-click selection still copy.
+func TestMouseDriverWordAndLineSelectionCopy(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		desc  string
+		steps func(*mouseDriver)
+		want  string
+	}{
+		{
+			desc:  "double-click selects a word",
+			steps: func(d *mouseDriver) { d.SelectWordAt(term.Coordinates{X: 7}) },
+			want:  "world",
+		},
+		{
+			desc:  "triple-click selects a line",
+			steps: func(d *mouseDriver) { d.SelectLine(1) },
+			want:  "foo_bar\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+			tm := mockTabManager{}
+			comp, err := NewComponent(&testExecutor{}, &testExecutor{}, &tm, DefaultConfig())
+			require.NoError(t, err)
+			p := comp.parserHandler
+			p.sync.primBuf.SetDefaultChar(' ')
+			comp.Resize(16, 3)
+			writeToBuffer(p, "hello world\nfoo_bar")
+
+			clip := clipboard.NewInMemory()
+			driver := &mouseDriver{t: comp, clipboard: clip}
+			tc.steps(driver)
+
+			pasted, err := clip.Paste(clipboard.DefaultRegisterID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, pasted.Text)
+		})
+	}
+}
+
+// TestMouseDriverGestures drives the driver through mouse.Mouse, as
+// Handler does, so the SDK's edge auto-scroll and the actions that
+// separate one gesture from the next are exercised with it. The buffer
+// has scrollback so that auto-scroll in the top rows has an effect.
+func TestMouseDriverGestures(t *testing.T) {
+	t.Parallel()
+
+	const (
+		sentinel = "previously-copied"
+		wordRow  = 4 // shows "hello world"
+	)
+
+	type env struct {
+		comp  *Component
+		clip  clipboard.Register
+		mouse *mouse.Mouse
+	}
+	type step func(*testing.T, env)
+	ev := func(key term.Key, x, y int) step {
+		return func(_ *testing.T, e env) { e.mouse.Handle(mouseEv(key, x, y)) }
+	}
+	left := func(x, y int) step { return ev(term.MouseLeft, x, y) }
+	release := func(x, y int) step { return ev(term.MouseRelease, x, y) }
+
+	cases := []struct {
+		desc       string
+		steps      []step
+		want       string // clipboard after the steps
+		wantScroll int
+	}{
+		{
+			desc:  "click with jitter in the top rows neither scrolls nor copies",
+			steps: []step{left(1, 1), left(1, 1), left(1, 1), release(1, 1)},
+			want:  sentinel,
+		},
+		{
+			desc:       "drag in the top rows auto-scrolls",
+			steps:      []step{left(1, 1), left(3, 1)},
+			want:       "3",
+			wantScroll: 1,
+		},
+		{
+			desc:       "wheel after an unreleased click scrolls",
+			steps:      []step{left(1, wordRow), ev(term.MouseWheelUp, 1, wordRow)},
+			want:       sentinel,
+			wantScroll: 1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+			tm := mockTabManager{}
+			comp, err := NewComponent(&testExecutor{}, &testExecutor{}, &tm, DefaultConfig())
+			require.NoError(t, err)
+			p := comp.parserHandler
+			p.sync.primBuf.SetDefaultChar(' ')
+			comp.Resize(16, 6)
+			writeToBuffer(p, "s0\ns1\ns2\ns3\ns4\ns5\nhello world\nfoo_bar")
+
+			clip := clipboard.NewInMemory()
+			require.NoError(t, clip.Copy(clipboard.DefaultRegisterID, clipboard.Data{Text: sentinel}))
+			e := env{comp: comp, clip: clip, mouse: mouse.New(&mouseDriver{t: comp, clipboard: clip})}
+			for _, s := range tc.steps {
+				s(t, e)
+			}
+
+			pasted, err := clip.Paste(clipboard.DefaultRegisterID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, pasted.Text)
+			assert.Equal(t, tc.wantScroll, comp.scrollY())
+		})
+	}
+}
+
+// TestHandlerMouseTrackingKeepsScrollback asserts that a drag through the
+// top rows belongs to a program tracking the mouse on the primary screen
+// (fzf --height): it neither scrolls the scrollback nor highlights.
+func TestHandlerMouseTrackingKeepsScrollback(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		modes []vteparser.PrivateMode
+	}{
+		{"click tracking", []vteparser.PrivateMode{
+			vteparser.PrivateModeReportMouseClicks, vteparser.PrivateModeSgrMouse}},
+		{"button-event tracking", []vteparser.PrivateMode{
+			vteparser.PrivateModeReportCellMouseMotion, vteparser.PrivateModeSgrMouse}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			comp, err := NewComponent(&testExecutor{}, &testExecutor{}, &mockTabManager{}, DefaultConfig())
+			require.NoError(t, err)
+			comp.Resize(16, 6)
+			writeToBuffer(comp.parserHandler, "s0\ns1\ns2\ns3\ns4\ns5\nhello world\nfoo_bar")
+			for _, mode := range tc.modes {
+				comp.parserHandler.SetPrivateMode(mode)
+			}
+			d := &mouseDriver{t: comp, clipboard: clipboard.NewInMemory()}
+			h := &Handler{comp: comp, mouseDriver: d, mouse: mouse.New(d)}
+
+			for _, ev := range []term.Event{
+				mouseEv(term.MouseLeft, 1, 1),
+				mouseEv(term.MouseLeft, 1, 1),
+				mouseEv(term.MouseLeft, 3, 0),
+				mouseEv(term.MouseLeft, 5, 0),
+				mouseEv(term.MouseRelease, 5, 0),
+			} {
+				h.handleInput(ev, keyEncoding{})
+			}
+
+			assert.Equal(t, 0, comp.scrollY())
+			sel, ok := comp.Selection()
+			assert.False(t, ok, "unexpected highlight %q", sel)
 		})
 	}
 }

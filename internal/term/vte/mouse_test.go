@@ -261,6 +261,13 @@ func TestMouseDriverSelectionCopy(t *testing.T) {
 			want: "ello",
 		},
 		{
+			// Every tick after the first extends a highlight that already
+			// exists, which a single jump to the final cell never does.
+			desc: "drag right one cell at a time",
+			drag: []term.Coordinates{{X: 2}, {X: 3}, {X: 4}, {X: 5}},
+			want: "ello ",
+		},
+		{
 			desc: "drag left",
 			drag: []term.Coordinates{{X: 0}},
 			want: "he",
@@ -300,6 +307,15 @@ func TestMouseDriverSelectionCopy(t *testing.T) {
 			for _, pos := range tc.drag {
 				driver.SetSelectionEnd(pos)
 			}
+			if tc.want != "" {
+				highlighted, highlightedOK := comp.Selection()
+				require.True(t, highlightedOK)
+				assert.Equal(t, tc.want, highlighted, "highlight before release")
+				held, err := clip.Paste(clipboard.DefaultRegisterID)
+				require.NoError(t, err)
+				assert.Equal(t, sentinel, held.Text, "clipboard waits for release")
+			}
+			driver.OnAction(term.Event{}, term.Coordinates{}, mouse.Release)
 
 			got, ok := comp.Selection()
 			pasted, err := clip.Paste(clipboard.DefaultRegisterID)
@@ -369,8 +385,10 @@ func TestMouseDriverGestures(t *testing.T) {
 	t.Parallel()
 
 	const (
-		sentinel = "previously-copied"
-		wordRow  = 4 // shows "hello world"
+		sentinel  = "previously-copied"
+		elsewhere = "copied-elsewhere"
+		wordRow   = 4 // shows "hello world"
+		otherRow  = 5
 	)
 
 	type env struct {
@@ -384,6 +402,13 @@ func TestMouseDriverGestures(t *testing.T) {
 	}
 	left := func(x, y int) step { return ev(term.MouseLeft, x, y) }
 	release := func(x, y int) step { return ev(term.MouseRelease, x, y) }
+	// esc mirrors Handler.handleInput, which clears the highlight on Esc
+	// without going through the driver.
+	esc := func(_ *testing.T, e env) { e.comp.Unselect() }
+	copyElsewhere := func(t *testing.T, e env) {
+		require.NoError(t, e.clip.Copy(clipboard.DefaultRegisterID, clipboard.Data{Text: elsewhere}))
+	}
+	drag := []step{left(1, wordRow), left(4, wordRow), release(4, wordRow)}
 
 	cases := []struct {
 		desc       string
@@ -392,6 +417,11 @@ func TestMouseDriverGestures(t *testing.T) {
 		wantScroll int
 	}{
 		{
+			desc:  "drag copies on release",
+			steps: drag,
+			want:  "ello",
+		},
+		{
 			desc:  "click with jitter in the top rows neither scrolls nor copies",
 			steps: []step{left(1, 1), left(1, 1), left(1, 1), release(1, 1)},
 			want:  sentinel,
@@ -399,7 +429,7 @@ func TestMouseDriverGestures(t *testing.T) {
 		{
 			desc:       "drag in the top rows auto-scrolls",
 			steps:      []step{left(1, 1), left(3, 1)},
-			want:       "3",
+			want:       sentinel,
 			wantScroll: 1,
 		},
 		{
@@ -407,6 +437,23 @@ func TestMouseDriverGestures(t *testing.T) {
 			steps:      []step{left(1, wordRow), ev(term.MouseWheelUp, 1, wordRow)},
 			want:       sentinel,
 			wantScroll: 1,
+		},
+		{
+			desc: "right click after a finished drag keeps a later copy",
+			steps: append(drag[:len(drag):len(drag)], esc, copyElsewhere,
+				ev(term.MouseRight, 8, otherRow), release(8, otherRow)),
+			want: elsewhere,
+		},
+		{
+			desc: "middle click after a finished drag keeps a later copy",
+			steps: append(drag[:len(drag):len(drag)], copyElsewhere,
+				ev(term.MouseMiddle, 8, otherRow), release(8, otherRow)),
+			want: elsewhere,
+		},
+		{
+			desc:  "Esc during a drag leaves nothing to copy",
+			steps: []step{left(1, wordRow), left(4, wordRow), esc, release(4, wordRow)},
+			want:  sentinel,
 		},
 	}
 

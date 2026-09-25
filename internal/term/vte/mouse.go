@@ -72,7 +72,7 @@ func (e *mouseDriver) OnAction(
 ) bool {
 	// The SDK reports held-button moves without an action, so any action
 	// ends the previous left-button gesture.
-	e.drag = dragIdle
+	e.endDrag()
 	switch action {
 	case mouse.LeftClick:
 		e.drag = dragPressed
@@ -84,6 +84,16 @@ func (e *mouseDriver) OnAction(
 	default:
 		return false
 	}
+}
+
+// endDrag copies the highlight a drag produced. Copying runs the system
+// clipboard command and waits for it on the event loop, so it happens
+// once per gesture rather than on every drag tick.
+func (e *mouseDriver) endDrag() {
+	if e.drag == dragSelecting {
+		e.copySelectionToClipboard()
+	}
+	e.drag = dragIdle
 }
 
 type mouseAction uint8
@@ -323,7 +333,6 @@ func (e *mouseDriver) SetSelectionEnd(pos term.Coordinates) {
 	}
 	e.t.Select(start)
 	e.t.SelectEnd(end)
-	e.copySelectionToClipboard()
 }
 
 func (e *mouseDriver) SelectWordAt(pos term.Coordinates) {
@@ -346,7 +355,10 @@ func (e *mouseDriver) Height() int {
 }
 
 func (e *mouseDriver) copySelectionToClipboard() {
-	data, _ := e.t.Selection()
+	data, ok := e.t.Selection()
+	if !ok {
+		return
+	}
 	clipdata := clipboard.Data{Text: data}
 	err := e.clipboard.Copy(clipboard.DefaultRegisterID, clipdata)
 	if err != nil {

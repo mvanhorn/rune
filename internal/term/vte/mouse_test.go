@@ -17,6 +17,8 @@
 package vte
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -525,6 +527,72 @@ func TestHandlerMouseTrackingKeepsScrollback(t *testing.T) {
 			assert.Equal(t, 0, comp.scrollY())
 			sel, ok := comp.Selection()
 			assert.False(t, ok, "unexpected highlight %q", sel)
+		})
+	}
+}
+
+// TestMouseDriverDragScrollsDown drags through a scrolled-back terminal
+// with more history than fits on screen. The SDK's bottom auto-scroll zone
+// is the last rows of the pane, so a drag into it must reveal the next
+// lines and extend the highlight over them.
+func TestMouseDriverDragScrollsDown(t *testing.T) {
+	t.Parallel()
+
+	const scrollBack = 10
+	// At scrollBack, window row 4 shows r16.
+	press := mouseEv(term.MouseLeft, 1, 4)
+
+	cases := []struct {
+		desc       string
+		drag       []term.Event
+		want       string // clipboard after release
+		wantScroll int
+	}{
+		{
+			desc: "drag into the bottom rows",
+			drag: []term.Event{
+				mouseEv(term.MouseLeft, 1, 5),
+				mouseEv(term.MouseLeft, 1, 6),
+				mouseEv(term.MouseLeft, 1, 7),
+			},
+			want:       "16       \nr17       \nr18       \nr19       \nr20       \nr2",
+			wantScroll: scrollBack - 3,
+		},
+		{
+			desc:       "drag above the bottom rows",
+			drag:       []term.Event{mouseEv(term.MouseLeft, 3, 4)},
+			want:       "16 ",
+			wantScroll: scrollBack,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+			comp, err := NewComponent(&testExecutor{}, &testExecutor{}, &mockTabManager{}, DefaultConfig())
+			require.NoError(t, err)
+			comp.parserHandler.sync.primBuf.SetDefaultChar(' ')
+			comp.Resize(10, 8)
+			lines := make([]string, 30)
+			for i := range lines {
+				lines[i] = fmt.Sprintf("r%02d", i)
+			}
+			writeToBuffer(comp.parserHandler, strings.Join(lines, "\n"))
+			require.True(t, comp.ScrollUp(scrollBack))
+			require.Equal(t, scrollBack, comp.scrollY())
+
+			clip := clipboard.NewInMemory()
+			m := mouse.New(&mouseDriver{t: comp, clipboard: clip})
+			m.Handle(press)
+			for _, ev := range tc.drag {
+				m.Handle(ev)
+			}
+			m.Handle(mouseEv(term.MouseRelease, 1, 7))
+
+			assert.Equal(t, tc.wantScroll, comp.scrollY())
+			pasted, err := clip.Paste(clipboard.DefaultRegisterID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, pasted.Text)
 		})
 	}
 }

@@ -350,8 +350,10 @@ func (e *mouseDriver) Width() int {
 	return e.t.MaxWidth()
 }
 
+// Height bounds the SDK's bottom auto-scroll zone, which is compared with
+// window rows, so it must not count the scrollback.
 func (e *mouseDriver) Height() int {
-	return e.t.Height()
+	return e.t.screenHeight()
 }
 
 func (e *mouseDriver) copySelectionToClipboard() {

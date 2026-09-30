@@ -450,6 +450,15 @@ func (t *Component) scrollY() int {
 	return t.scroll.Offset().Y
 }
 
+// screenHeight returns the number of rows the terminal window shows, the
+// range of window coordinates such as mouse positions. Unlike Height it
+// excludes the scrollback.
+func (t *Component) screenHeight() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.height
+}
+
 // MaxScrollOffset returns the current vertical scroll offset.
 func (t *Component) MaxScrollOffset() int {
 	t.mu.Lock()

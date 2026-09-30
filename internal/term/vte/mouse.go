@@ -286,16 +286,14 @@ func (e *mouseDriver) ScrollUp(n int) (ok bool) {
 	if e.drag == dragPressed {
 		return
 	}
-	e.t.ScrollUp(n)
-	return
+	return e.t.ScrollUp(n)
 }
 
 func (e *mouseDriver) ScrollDown(n int) (ok bool) {
 	if e.drag == dragPressed {
 		return
 	}
-	e.t.ScrollDown(n)
-	return
+	return e.t.ScrollDown(n)
 }
 
 func (e *mouseDriver) ClearSelection() {

@@ -430,7 +430,7 @@ func TestMouseDriverGestures(t *testing.T) {
 		},
 		{
 			desc:       "drag in the top rows auto-scrolls",
-			steps:      []step{left(1, 1), left(3, 1)},
+			steps:      []step{left(1, 2), left(1, 1)},
 			want:       sentinel,
 			wantScroll: 1,
 		},
@@ -593,6 +593,102 @@ func TestMouseDriverDragScrollsDown(t *testing.T) {
 			pasted, err := clip.Paste(clipboard.DefaultRegisterID)
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, pasted.Text)
+		})
+	}
+}
+
+// TestMouseDriverDragScrollsTowardSelection pins that a drag through a
+// scrolled-back terminal only auto-scrolls toward the edge the selection
+// grows to, which relies on ScrollUp and ScrollDown reporting whether the
+// view moved.
+func TestMouseDriverDragScrollsTowardSelection(t *testing.T) {
+	t.Parallel()
+
+	const (
+		height     = 12
+		scrollBack = 10
+	)
+	// At scrollBack, window row 0 shows r18 and row 11 shows r29.
+	rowsDown := func(from, to int) []int {
+		var ys []int
+		for y := from; y <= to; y++ {
+			ys = append(ys, y)
+		}
+		return ys
+	}
+	lines := func(first, last int, lastCols int) string {
+		var b strings.Builder
+		for i := first; i <= last; i++ {
+			line := fmt.Sprintf("r%02d       ", i)
+			if i == first {
+				line = line[1:]
+			}
+			if i == last {
+				line = line[:lastCols]
+			} else {
+				line += "\n"
+			}
+			b.WriteString(line)
+		}
+		return b.String()
+	}
+
+	cases := []struct {
+		desc       string
+		press      int
+		drag       []int
+		wantScroll int
+		wantCopy   string // clipboard after release, unchecked when empty
+	}{
+		{
+			// Only the bottom rows scroll: 9, 10 and 11 reveal r30-r32.
+			// Each scroll follows the selection update, so the last
+			// revealed line is selected only by the next move.
+			desc:       "press in the top rows and drag down",
+			press:      0,
+			drag:       rowsDown(0, height-1),
+			wantScroll: scrollBack - 3,
+			wantCopy:   lines(18, 31, 3),
+		},
+		{
+			// The first scroll moves the pressed line to row 4, so the
+			// pointer back on row 3 is still above it and keeps scrolling.
+			desc:       "anchor follows the view while scrolling up",
+			press:      3,
+			drag:       []int{2, 3},
+			wantScroll: scrollBack + 2,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+			comp, err := NewComponent(&testExecutor{}, &testExecutor{}, &mockTabManager{}, DefaultConfig())
+			require.NoError(t, err)
+			comp.parserHandler.sync.primBuf.SetDefaultChar(' ')
+			comp.Resize(10, height)
+			buf := make([]string, 40)
+			for i := range buf {
+				buf[i] = fmt.Sprintf("r%02d", i)
+			}
+			writeToBuffer(comp.parserHandler, strings.Join(buf, "\n"))
+			require.True(t, comp.ScrollUp(scrollBack))
+
+			clip := clipboard.NewInMemory()
+			m := mouse.New(&mouseDriver{t: comp, clipboard: clip})
+			m.Handle(mouseEv(term.MouseLeft, 1, tc.press))
+			for _, y := range tc.drag {
+				m.Handle(mouseEv(term.MouseLeft, 2, y))
+			}
+
+			assert.Equal(t, tc.wantScroll, comp.scrollY())
+			if tc.wantCopy == "" {
+				return
+			}
+			m.Handle(mouseEv(term.MouseRelease, 2, tc.drag[len(tc.drag)-1]))
+			pasted, err := clip.Paste(clipboard.DefaultRegisterID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantCopy, pasted.Text)
 		})
 	}
 }
